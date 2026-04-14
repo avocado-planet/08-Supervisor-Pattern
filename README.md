@@ -1,6 +1,5 @@
 # LangGraph Supervisor パターン
 
-
 ## 2つの実装方法
 
 同じITサポートルーティングシステムを2通りで実装できる。
@@ -45,13 +44,20 @@ from langgraph.checkpoint.memory import InMemorySaver
 llm = ChatAnthropic(model="claude-3-5-haiku-20241022")
 
 # Worker Agent（新APIで作成）
+# create_agent() はすでにコンパイル済みのため .compile() は呼べない
+# .name 属性を直接セットする
 network_agent = create_agent(
     model=llm,
     tools=[check_network_status, create_network_ticket],
     system_prompt="あなたはネットワーク専門エンジニアです...",
 )
+network_agent.name = "network_agent"  # ← create_supervisor が name を要求するため必須
+
 account_agent = create_agent(model=llm, tools=[...], system_prompt="...")
+account_agent.name = "account_agent"
+
 hardware_agent = create_agent(model=llm, tools=[...], system_prompt="...")
+hardware_agent.name = "hardware_agent"
 
 # Supervisor（ライブラリ版）
 workflow = create_supervisor(
