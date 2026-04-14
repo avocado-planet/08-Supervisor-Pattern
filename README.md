@@ -1,199 +1,254 @@
 # LangGraph Supervisor パターン
 
-## 概要
 
-Supervisorパターンは、1つの中央Agentが複数の専門Worker Agentを指揮する最も主流なマルチエージェント構成。本資料ではITサポートチケットルーティングシステムを題材に、実装の全体像を解説する。
+## 2つの実装方法
 
----
-
-## システム構成
+同じITサポートルーティングシステムを2通りで実装できる。
 
 ```
 ユーザーリクエスト
        │
        ▼
-┌─────────────────────────────────────┐
-│         Supervisor Agent            │
-│  ・リクエスト内容を解析              │
-│  ・適切なAgentを選択               │
-│  ・最終回答をまとめてユーザーへ返す  │
-└────────┬──────────┬──────────┬──────┘
-         │          │          │
-         ▼          ▼          ▼
-   network_agent  account_agent  hardware_agent
-   （ネットワーク） （アカウント）  （ハードウェア）
+  Supervisor Agent
+   ├─→ network_agent  （ネットワーク障害・接続）
+   ├─→ account_agent  （アカウント・認証）
+   └─→ hardware_agent （PC・周辺機器）
 ```
 
 ---
 
-## 実装ステップ
+## 方法A: langgraph-supervisor ライブラリ
 
-### Step 1: ツール定義
+### 特徴
 
-Worker Agentが使用するツールをPython関数として定義する。`@tool` デコレータを付けるだけでLangChainのツールになる。
+- `create_supervisor()` にWorker Agentのリストを渡すだけ
+- handoff toolが自動生成される
+- 素早くプロトタイプを作るのに向いている
 
-```python
-from langchain_core.tools import tool
+### 制御フロー
 
-@tool
-def check_network_status(location: str) -> str:
-    """指定ロケーションのネットワーク状態を確認する。"""
-    # 本番では実際のネットワーク監視APIを呼ぶ
-    return f"{location}: 正常稼働中"
-
-@tool
-def reset_user_password(username: str) -> str:
-    """ユーザーのパスワードをリセットし、仮パスワードを発行する。"""
-    return f"パスワードリセット完了: [{username}]"
+```
+Supervisor
+  └─[transfer_to_network_agent]→ network_agent
+                                      └─→ Supervisor（結果を返す）
 ```
 
-**ポイント**: docstringがLLMへのツール説明になるため、何をするツールか明確に書く。
-
----
-
-### Step 2: Worker Agent の作成
-
-`create_react_agent()` で各専門Agentを作成する。
+### 実装
 
 ```python
+# インストール: pip install langgraph-supervisor langchain langchain-anthropic
+from langchain.agents import create_agent          # ✅ 新API
 from langchain_anthropic import ChatAnthropic
-from langgraph.prebuilt import create_react_agent
-
-llm = ChatAnthropic(model="claude-3-5-haiku-20241022")
-
-network_agent = create_react_agent(
-    model=llm,
-    tools=[check_network_status, create_network_ticket],
-    name="network_agent",           # ← Supervisorがこの名前で呼ぶ
-    prompt="あなたはネットワーク専門エンジニアです...",
-)
-```
-
-**`name` パラメータが重要**: Supervisorはこの名前を使ってAgentを指名する。
-
----
-
-### Step 3: Supervisor の作成
-
-```python
 from langgraph_supervisor import create_supervisor
 from langgraph.checkpoint.memory import InMemorySaver
 
-checkpointer = InMemorySaver()  # マルチターン会話用
+llm = ChatAnthropic(model="claude-3-5-haiku-20241022")
 
+# Worker Agent（新APIで作成）
+network_agent = create_agent(
+    model=llm,
+    tools=[check_network_status, create_network_ticket],
+    system_prompt="あなたはネットワーク専門エンジニアです...",
+)
+account_agent = create_agent(model=llm, tools=[...], system_prompt="...")
+hardware_agent = create_agent(model=llm, tools=[...], system_prompt="...")
+
+# Supervisor（ライブラリ版）
 workflow = create_supervisor(
     agents=[network_agent, account_agent, hardware_agent],
     model=llm,
-    prompt=supervisor_prompt,
-    output_mode="last_message",   # Supervisorの最終回答のみ返す
+    prompt="あなたはITサポートSupervisorです...",
+    output_mode="last_message",
 )
+app = workflow.compile(checkpointer=InMemorySaver())
 
-app = workflow.compile(checkpointer=checkpointer)
-```
-
----
-
-### Step 4: 実行
-
-```python
-from langchain_core.messages import HumanMessage
-
-config = {"configurable": {"thread_id": "ticket-001"}}
-
+# 実行
 result = app.invoke(
     {"messages": [HumanMessage(content="大阪支店でネットワークが繋がりません。")]},
-    config=config,
+    config={"configurable": {"thread_id": "ticket-001"}},
 )
-
 print(result["messages"][-1].content)
 ```
 
 ---
 
-## create_supervisor の主要パラメータ
+## 方法B: ツール経由の手動実装（LangChain公式推奨）
 
-| パラメータ | 型 | デフォルト | 説明 |
-|-----------|-----|-----------|------|
-| `agents` | list | 必須 | 管理するWorker Agentのリスト |
-| `model` | LLM | 必須 | SupervisorのLLM |
-| `prompt` | str/SystemMessage | None | Supervisorへの指示 |
-| `output_mode` | str | `"last_message"` | 出力形式（後述） |
-| `add_handoff_messages` | bool | True | handoffメッセージを履歴に含めるか |
-| `parallel_tool_calls` | bool | False | 複数AgentへのhandoffをPythonで並列化 |
+### 特徴
 
-### output_mode の違い
+- Worker AgentをPythonの `@tool` でラップし、Supervisorの「ツールリスト」に追加する
+- `langgraph-supervisor` ライブラリ不要（`langchain` のみで完結）
+- Supervisorに渡す情報（コンテキスト）をコードで明示的に制御できる
+
+### 制御フロー
 
 ```
-last_message（推奨）:
-  ユーザー → Supervisor → Worker A → Worker B → [Supervisorの最終まとめ]
-  返却: [Supervisorの最終まとめ] のみ
+Supervisor
+  └─[call_network_agent(request="大阪支店の問題...")]→ 結果が直接返る
+```
 
-full_history:
-  ユーザー → Supervisor → Worker A → Worker B → [Supervisorの最終まとめ]
-  返却: 全メッセージ（Worker内のやりとりも含む）
+方法Aのように「制御を渡す→受け取る」という往復がなく、
+SupervisorがWorkerを関数のように呼び出す。
+
+### なぜこれが推奨か
+
+方法Aの問題（telephone game）:
+
+```
+ユーザー: 「大阪支店のパケットロス問題を調査してください」
+  ↓
+Supervisor: 「network_agentへ転送します」
+  ↓
+network_agent: 「パケットロス15%を確認しました。チケットNET-1234を起票しました」
+  ↓
+Supervisor（言い換え）: 「ネットワーク障害が確認され、対応中です」  ← 情報が欠落・変質
+```
+
+方法Bでは Worker の回答がそのまま Supervisor のツール結果として返るため、
+情報の欠落が発生しにくい。
+
+### 実装
+
+```python
+# インストール: pip install langchain langchain-anthropic
+from langchain.agents import create_agent
+from langchain_core.tools import tool
+from langchain_core.messages import HumanMessage
+from langchain_anthropic import ChatAnthropic
+from langgraph.checkpoint.memory import InMemorySaver
+
+llm = ChatAnthropic(model="claude-3-5-haiku-20241022")
+
+# Step 1: Worker Agentを作成（方法Aと同じ）
+network_agent = create_agent(model=llm, tools=[...], system_prompt="...")
+account_agent = create_agent(model=llm, tools=[...], system_prompt="...")
+hardware_agent = create_agent(model=llm, tools=[...], system_prompt="...")
+
+# Step 2: Worker AgentをPythonの @tool でラップ
+@tool
+def call_network_agent(request: str) -> str:
+    """
+    ネットワーク専門Agentに問い合わせる。
+    ネットワーク障害、接続問題、VPN、Wi-Fiに関するリクエストに使用。
+    request: ネットワーク問題の詳細説明
+    """
+    result = network_agent.invoke(
+        {"messages": [HumanMessage(content=request)]}
+    )
+    return result["messages"][-1].content
+
+@tool
+def call_account_agent(request: str) -> str:
+    """
+    アカウント管理専門Agentに問い合わせる。
+    パスワードリセット、アカウントロック解除に使用。
+    request: アカウント問題の詳細（ユーザー名を含めること）
+    """
+    result = account_agent.invoke(
+        {"messages": [HumanMessage(content=request)]}
+    )
+    return result["messages"][-1].content
+
+@tool
+def call_hardware_agent(request: str) -> str:
+    """
+    ハードウェア専門Agentに問い合わせる。
+    PC・モニター・キーボード・マウスの問題に使用。
+    request: ハードウェア問題の詳細（ユーザー名と機器種類を含めること）
+    """
+    result = hardware_agent.invoke(
+        {"messages": [HumanMessage(content=request)]}
+    )
+    return result["messages"][-1].content
+
+# Step 3: Supervisorは「ツールとしてのWorker Agent」を持つ普通のcreate_agent
+supervisor = create_agent(
+    model=llm,
+    tools=[call_network_agent, call_account_agent, call_hardware_agent],
+    system_prompt="""
+あなたはITサポートデスクのSupervisorです。
+
+ツールの使い分け:
+- call_network_agent : ネットワーク・VPN・Wi-Fiの問題
+- call_account_agent : パスワード・アカウントロック・権限の問題
+- call_hardware_agent: PC・モニター・キーボードの問題
+""",
+)
+
+app = supervisor.compile(checkpointer=InMemorySaver())
+
+# 実行（方法Aと同じ呼び出し方）
+result = app.invoke(
+    {"messages": [HumanMessage(content="大阪支店でネットワークが繋がりません。")]},
+    config={"configurable": {"thread_id": "ticket-001"}},
+)
+print(result["messages"][-1].content)
 ```
 
 ---
 
-## マルチターン会話の仕組み
+## 方法A vs 方法B 比較
 
-`InMemorySaver` と `thread_id` の組み合わせで会話継続が可能。
+| 観点 | 方法A (langgraph-supervisor) | 方法B（推奨） |
+|------|------------------------------|--------------|
+| 追加パッケージ | `langgraph-supervisor` 必要 | `langchain` のみ |
+| コード量 | 少ない | やや多い |
+| handoff仕組み | 自動生成（ブラックボックス） | `@tool` で明示的 |
+| コンテキスト制御 | ライブラリ任せ | コードで明示 |
+| 情報欠落リスク | やや高い | 低い |
+| カスタマイズ性 | 制限あり | 無制限 |
+| 向いている場面 | プロトタイプ・検証 | 本番・複雑なフロー |
+
+---
+
+## create_agent の主要パラメータ
 
 ```python
-checkpointer = InMemorySaver()
-app = workflow.compile(checkpointer=checkpointer)
+from langchain.agents import create_agent
+
+agent = create_agent(
+    model=llm,                    # LLMインスタンス
+    tools=[tool1, tool2],         # ツールリスト
+    system_prompt="...",          # システムプロンプト（文字列）
+    # その他オプション
+    # middleware=[...],           # ミドルウェア（新機能）
+    # checkpointer=...,           # 直接渡す場合
+)
+
+# compile() でチェックポインターを付与
+app = agent.compile(checkpointer=InMemorySaver())
+```
+
+`create_agent` は `create_react_agent` との主な違い:
+
+| | `create_react_agent`（非推奨） | `create_agent`（推奨） |
+|--|-------------------------------|----------------------|
+| インポート | `langgraph.prebuilt` | `langchain.agents` |
+| システムプロンプト引数 | `prompt=` | `system_prompt=` |
+| ミドルウェア | なし | `middleware=` で対応 |
+| 状態 | 非推奨（後方互換維持） | 現在の推奨 |
+
+---
+
+## マルチターン会話
+
+```python
+# InMemorySaver でセッション間の状態を保持
+app = agent.compile(checkpointer=InMemorySaver())
+
+# 同じ thread_id を使うと前の会話を記憶
+config = {"configurable": {"thread_id": "ticket-004"}}
 
 # 1回目
-app.invoke(
-    {"messages": [HumanMessage("PCのキーボードが壊れました。")]},
-    config={"configurable": {"thread_id": "ticket-004"}},
-)
+app.invoke({"messages": [HumanMessage("キーボードが壊れました。")]}, config=config)
 
-# 2回目: 同じthread_idで続きの会話（前の内容を記憶している）
-app.invoke(
-    {"messages": [HumanMessage("ユーザーはsuzukiです。")]},
-    config={"configurable": {"thread_id": "ticket-004"}},
-)
+# 2回目: 前の内容を覚えている
+app.invoke({"messages": [HumanMessage("ユーザーはsuzukiです。")]}, config=config)
 ```
 
 ---
 
-## handoff の仕組み
-
-SupervisorからWorker Agentへの委譲は **ツール呼び出し** として実装されている。
-
-```
-Supervisorの内部ツールリスト:
-  - transfer_to_network_agent()   ← 自動生成
-  - transfer_to_account_agent()   ← 自動生成
-  - transfer_to_hardware_agent()  ← 自動生成
-```
-
-LLMが「このリクエストはnetwork_agentが適切」と判断すると、`transfer_to_network_agent()` を呼び出し、制御がWorker Agentに移る。Worker Agentは処理完了後、Supervisorに結果を返す。
-
-カスタムhandoffツールを使う場合:
-
-```python
-from langgraph_supervisor import create_handoff_tool
-
-workflow = create_supervisor(
-    agents=[network_agent, account_agent],
-    tools=[
-        create_handoff_tool(
-            agent_name="network_agent",
-            name="assign_to_network_team",          # ツール名をカスタマイズ
-            description="ネットワーク障害・接続問題を担当チームに割り当てる",
-        ),
-    ],
-    model=llm,
-)
-```
-
----
-
-## 内部動作の観察方法
-
-`stream()` + `stream_mode="updates"` でノード単位に処理を追える。
+## 内部動作の観察
 
 ```python
 for chunk in app.stream(
@@ -203,131 +258,39 @@ for chunk in app.stream(
 ):
     for node_name, node_output in chunk.items():
         print(f"▶ ノード: [{node_name}]")
-        # node_name が "supervisor", "network_agent" などになる
-```
-
-**出力例（複数Agent振り分け時）:**
-
-```
-▶ ノード: [supervisor]        ← ルーティング判断
-▶ ノード: [account_agent]     ← アカウント処理
-▶ ノード: [supervisor]        ← 結果受け取り・次のAgentを指名
-▶ ノード: [network_agent]     ← ネットワーク処理
-▶ ノード: [supervisor]        ← 最終まとめ生成
+        # 方法Bでは call_network_agent などのツール名がそのまま見える
 ```
 
 ---
 
-## Supervisor promptの書き方
+## ツールのdocstring が重要
 
-Supervisorの振る舞いはpromptで大きく変わる。実務で効果的なパターン:
-
-```python
-supervisor_prompt = """
-あなたはITサポートデスクのSupervisorです。
-
-担当Agentの選択基準:
-- network_agent : ネットワーク・VPN・Wi-Fi・接続に関する問題
-- account_agent : パスワード・ログイン・アカウントロック・権限
-- hardware_agent: PC・モニター・キーボード・周辺機器
-
-ルール:
-1. 複数の問題が含まれる場合は、それぞれ適切なAgentに順番に振り分ける
-2. 不明な場合はaccount_agentに振り分ける（デフォルト）
-3. すべての対応完了後、ユーザーへの簡潔なサマリーを日本語で返す
-"""
-```
-
-**promtのポイント:**
-- 各Agentの担当を明確に記述する
-- 複数問題の処理方針を明示する
-- デフォルトのフォールバックAgentを指定する
-- 最終回答のフォーマットを指定する
-
----
-
-## 実装時の注意点
-
-### Worker AgentのnameはSnake_case
+方法Bでは `@tool` のdocstringがSupervisorのツール説明になる。
+SupervisorのLLMがこの説明を読んで「どのツールを呼ぶか」を判断するため、
+明確な説明を書くことがルーティング精度に直結する。
 
 ```python
-# ✅ 正しい
-create_react_agent(name="network_agent")
+# ❌ 曖昧な説明
+@tool
+def call_network_agent(request: str) -> str:
+    """ネットワークの問題を処理する。"""
+    ...
 
-# ❌ スペースや特殊文字は避ける
-create_react_agent(name="network agent")
+# ✅ 明確な説明（いつ使うか、何を渡すかを明記）
+@tool
+def call_network_agent(request: str) -> str:
+    """
+    ネットワーク専門Agentに問い合わせる。
+    ネットワーク障害、接続問題、VPN、Wi-Fiに関するリクエストに使用すること。
+    request: ネットワーク問題の詳細説明（ロケーション情報を含めること）
+    """
+    ...
 ```
-
-### Supervisorのpromptは具体的に
-
-LLMはpromptの曖昧さに敏感。担当Agentの選択基準が曖昧だと誤ルーティングが発生しやすい。
-
-### output_modeはlast_messageを推奨
-
-`full_history` はデバッグ用。本番では `last_message` で不要な情報を除外し、コンテキストウィンドウを節約する。
-
-### add_handoff_messages=False で履歴を整理
-
-Workerへの委譲メッセージ（"Transferring to network_agent..."）は最終ユーザーには不要なため、Falseにすることでノイズを減らせる。
-
----
-
-## よく使うパターン集
-
-### パターン1: シンプルなルーティング（本資料のメイン）
-
-```python
-workflow = create_supervisor(
-    agents=[agent_a, agent_b, agent_c],
-    model=llm,
-    prompt="...",
-)
-app = workflow.compile()
-```
-
-### パターン2: メモリ付き（マルチターン）
-
-```python
-app = workflow.compile(checkpointer=InMemorySaver())
-# invoke時にthread_idを指定
-```
-
-### パターン3: 長期ストア付き
-
-```python
-from langgraph.store.memory import InMemoryStore
-store = InMemoryStore()
-app = workflow.compile(checkpointer=InMemorySaver(), store=store)
-```
-
-### パターン4: カスタムhandoffツール
-
-```python
-from langgraph_supervisor import create_handoff_tool
-workflow = create_supervisor(
-    agents=[...],
-    tools=[create_handoff_tool(agent_name="agent_a", description="...")],
-    model=llm,
-)
-```
-
----
-
-## まとめ
-
-| 概念 | 役割 |
-|------|------|
-| Supervisor | リクエストを解析し適切なWorkerに委譲・最終回答を生成 |
-| Worker Agent | 特定ドメインの処理を担当・結果をSupervisorに返す |
-| handoff tool | SupervisorからWorkerへの制御委譲の仕組み |
-| checkpointer | マルチターン会話のための状態永続化 |
-| thread_id | 会話スレッドの識別子 |
-| output_mode | 返却するメッセージの範囲を制御 |
 
 ---
 
 ## 参考
 
+- [LangChain v1.0 リリースノート](https://blog.langchain.com/langchain-langgraph-1dot0/)
+- [Build a personal assistant with subagents（公式チュートリアル）](https://docs.langchain.com/oss/python/langchain/multi-agent/subagents-personal-assistant)
 - [langgraph-supervisor GitHub](https://github.com/langchain-ai/langgraph-supervisor-py)
-- [LangGraph Supervisor Tutorial](https://langchain-ai.github.io/langgraph/tutorials/multi_agent/agent_supervisor/)
-- [Benchmarking Multi-Agent Architectures](https://blog.langchain.com/benchmarking-multi-agent-architectures/)
