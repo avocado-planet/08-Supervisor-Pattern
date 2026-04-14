@@ -212,18 +212,15 @@ print(result["messages"][-1].content)
 ```python
 from langchain.agents import create_agent
 
-agent = create_agent(
+app = create_agent(
     model=llm,                    # LLMインスタンス
     tools=[tool1, tool2],         # ツールリスト
     system_prompt="...",          # システムプロンプト（文字列）
+    checkpointer=...,             # チェックポインターを付与
     # その他オプション
     # middleware=[...],           # ミドルウェア（新機能）
     # checkpointer=...,           # 直接渡す場合
 )
-
-# compile() でチェックポインターを付与
-app = agent.compile(checkpointer=InMemorySaver())
-```
 
 `create_agent` は `create_react_agent` との主な違い:
 
@@ -240,7 +237,7 @@ app = agent.compile(checkpointer=InMemorySaver())
 
 ```python
 # InMemorySaver でセッション間の状態を保持
-app = agent.compile(checkpointer=InMemorySaver())
+checkpointer=InMemorySaver(), 
 
 # 同じ thread_id を使うと前の会話を記憶
 config = {"configurable": {"thread_id": "ticket-004"}}
